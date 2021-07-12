@@ -19,5 +19,7 @@ public:
 	MD5();
 
 	std::vector<md5byte> hash(const md5byte *data, int len);
+
+	static uint32_t hashLen();
 };
 

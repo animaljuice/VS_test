@@ -6,7 +6,7 @@
 #include <iostream>
 #include "MD5.h"
 
-constexpr uint64_t desiredReadBlockSize = 1ui64 << 32;
+constexpr uint64_t desiredReadBlockSize = 1ui64 << 27; // 128Mb reading block
 uint64_t blockSize = 1048576;
 uint64_t inFileSize;
 
@@ -90,47 +90,80 @@ int main()
 		return errCode;
 	}
 
-	std::atomic<long> blockCounter = 0;
-	std::map<int, std::vector<md5byte>> checksummBlocks;
+	std::map<uint64_t, std::vector<md5byte>> checksummBlocks;
 	std::mutex checksummBlocksMtx;
-	std::condition_variable readBlockWaiter;
 
+	//std::condition_variable readBlockWaiter;
+
+	std::mutex inFileMtx;
+
+	std::atomic<long> blockCounter = 0;
 	const auto fullBlockCount = inFileSize / blockSize;
-	const auto lastBlockSize = inFileSize % blockSize;
-	const uint64_t readBlockSize = desiredReadBlockSize - (desiredReadBlockSize % blockSize);
-	std::vector<unsigned char> buffer(readBlockSize);
+	/*const uint64_t readBlockSize = desiredReadBlockSize - (desiredReadBlockSize % blockSize);
+	std::vector<unsigned char> buffer(readBlockSize);*/
 
-	auto blockProcess = [&blockCounter, &fullBlockCount, inFile, outFile](std::mutex &mtx) {
+	auto blockProcess = [&blockCounter, &fullBlockCount, inFile, &inFileMtx, &checksummBlocksMtx, &checksummBlocks](std::mutex &mtx) {
 		MD5 sumGen;
+		std::vector<md5byte> inBlock(blockSize);
+		std::vector<md5byte> blockHash;
 		while (true)
 		{
 			auto blockIndex = blockCounter.fetch_add(1);
-			if (blockIndex >= fullBlockCount) {
-				break;
+			if (blockIndex < fullBlockCount) {
+				inFileMtx.lock();
+				fseek(inFile.get(), blockIndex * blockSize, SEEK_SET);
+				fread(inBlock.data(), 1, blockSize, inFile.get());
+				inFileMtx.unlock();
+
+				blockHash = sumGen.hash(inBlock.data(), inBlock.size());
+
+				checksummBlocksMtx.lock();
+				checksummBlocks[blockIndex] = blockHash;
+				checksummBlocksMtx.unlock();
 			}
 			else {
-				fread(buffer.data(), 1, blockSize, inFile.get());
-				sumGen.hash(buffer.data(), buffer.size());
+				break;
 			}
 		}
-	};
-
-	auto writeSumm = [&checksummBlocks, &checksummBlocksMtx]() {
-
 	};
 
 	std::vector<std::thread> threads(std::thread::hardware_concurrency());
 	std::vector<std::mutex> mutexes(threads.size());
 	for (size_t threadIndex = 0; threadIndex < threads.size(); threadIndex++)
 	{
-		mutexes[threadIndex].lock();
-		threads[threadIndex] = std::thread(blockProcess, mutexes[threadIndex]);
+		threads[threadIndex] = std::thread(blockProcess, std::ref(mutexes[threadIndex]));
 	}
 
-	while (true)
+	int curOutBlock = 0;
+
+	while (curOutBlock < fullBlockCount)
 	{
-		fread(buffer.data(), 1, buffer.size(), inFile.get());
+		std::vector<unsigned char> outData;
+
+		checksummBlocksMtx.lock();		
+		for (auto checksummIt = checksummBlocks.begin(); checksummIt != checksummBlocks.end();) {
+			if (checksummIt->first != curOutBlock) break;
+			++curOutBlock;
+			outData.insert(outData.end(), checksummIt->second.begin(), checksummIt->second.end());
+			auto eracedElement = checksummIt++;
+			checksummBlocks.erase(eracedElement);
+		}
+		checksummBlocksMtx.unlock();
+
+		fwrite(outData.data(), sizeof(decltype(outData)::value_type), outData.size(), outFile.get());
+
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
+
+	for (size_t threadIndex = 0; threadIndex < threads.size(); threadIndex++)
+	{
+		threads[threadIndex].join();
+	}
+
+	std::vector<md5byte> lastInData(inFileSize % blockSize);
+	fseek(inFile.get(), fullBlockCount * blockSize, SEEK_SET);
+	fread(lastInData.data(), 1, lastInData.size(), inFile.get());
+	fwrite(MD5().hash(lastInData.data(), lastInData.size()).data(), 1, MD5::hashLen(), outFile.get());
 
 	return 0;
 }

@@ -165,6 +165,11 @@ void MD5::transform(uint32_t buf[4], uint32_t const in[16])
 	buf[3] += d;
 }
 
+uint32_t MD5::hashLen()
+{
+	return 16;
+}
+
 MD5::MD5()
 {
 	init();
